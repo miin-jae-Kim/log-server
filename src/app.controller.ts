@@ -6,16 +6,20 @@ export class AppController {
   constructor(private readonly appService: AppService) {}
 
   /**
-   * curl -X POST http://localhost:3000/add-job -H "Content-Type: application/json" -d '{"message": "Hello from Bull Queue!"}'
+   * curl -X POST http://localhost:3000/add-job -H "Content-Type: application/json" -d '{"message": "Hello from Batch Queue!"}'
    */
   @Post('add-job')
   async addJob(@Body() data: any) {
-    await this.appService.addJob(data);
-    return { message: 'Job added successfully' };
+    return this.appService.addJob(data);
   }
 
   @Get('logs')
   async getLogs() {
     return this.appService.getLogs();
+  }
+
+  @Get('queue-size')
+  async getQueueSize() {
+    return { size: await this.appService.getQueueSize() };
   }
 }
