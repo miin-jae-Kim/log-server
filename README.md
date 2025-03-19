@@ -1,98 +1,133 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Log Server with Batch Processing
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+이 프로젝트는 로그 데이터를 배치 처리하는 서버입니다. 메모리 내 큐를 사용하여 데이터를 수집하고, 주기적으로 MongoDB에 일괄 저장하는 방식으로 동작합니다.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## 시스템 구조
 
-## Description
-
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
-
-## Project setup
-
-```bash
-$ npm install
+### 1. 데이터 흐름
+```
+[Client Request] → [NestJS Server] → [Memory Queue] → [MongoDB]
+                                      ↓
+                                [Redis Backup]
 ```
 
-## Compile and run the project
+### 2. 주요 컴포넌트
+- **NestJS Server**: API 요청을 처리하고 메모리 큐에 데이터를 추가
+- **Memory Queue**: 데이터를 임시 저장하는 메모리 내 큐
+- **Redis**: 서버 종료 시 큐 데이터를 백업
+- **MongoDB**: 최종 데이터 저장소
 
-```bash
-# development
-$ npm run start
+### 3. 배치 처리 메커니즘
+- **배치 크기**: 최대 1000개 항목
+- **처리 주기**: 5초마다 실행
+- **처리 방식**: BulkWrite를 사용하여 일괄 저장
 
-# watch mode
-$ npm run start:dev
+## 작동 원리
 
-# production mode
-$ npm run start:prod
+### 1. 데이터 수집
+```typescript
+// 클라이언트 요청 → 메모리 큐
+async addToQueue(data: any) {
+  this.queue.push({
+    message: 'Job processed',
+    data,
+    timestamp: new Date(),
+  });
+}
 ```
 
-## Run tests
+### 2. 배치 처리
+```typescript
+// 메모리 큐 → MongoDB
+private async processBatch() {
+  const batchSize = Math.min(this.BATCH_SIZE, this.queue.length);
+  const batch = this.queue.splice(0, batchSize);
+  
+  const operations = batch.map(item => ({
+    insertOne: {
+      document: item,
+      onDuplicateKeyUpdate: true,
+    },
+  }));
 
-```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+  await this.logModel.bulkWrite(operations);
+}
 ```
 
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g mau
-$ mau deploy
+### 3. 데이터 복구
+```typescript
+// 서버 시작 시 Redis에서 데이터 복구
+async onModuleInit() {
+  const savedData = await this.redis.get(this.REDIS_KEY);
+  if (savedData) {
+    this.queue = JSON.parse(savedData);
+    await this.redis.del(this.REDIS_KEY);
+  }
+}
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+### 4. 안전한 종료
+```typescript
+// 서버 종료 시 Redis에 데이터 백업
+private async handleShutdown() {
+  if (this.queue.length > 0) {
+    await this.redis.set(this.REDIS_KEY, JSON.stringify(this.queue));
+  }
+  await this.redis.quit();
+}
+```
 
-## Resources
+## API 엔드포인트
 
-Check out a few resources that may come in handy when working with NestJS:
+### 1. Job 추가
+```bash
+POST /add-job
+Content-Type: application/json
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+{
+  "message": "Test job"
+}
+```
 
-## Support
+### 2. 로그 조회
+```bash
+GET /logs
+```
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+### 3. 큐 크기 확인
+```bash
+GET /queue-size
+```
 
-## Stay in touch
+## 실행 방법
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+### 1. 의존성 설치
+```bash
+npm install
+```
 
-## License
+### 2. Docker 서비스 시작
+```bash
+docker compose up -d
+```
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+### 3. 서버 실행
+```bash
+npm run start:dev
+```
+
+## 시스템 요구사항
+- Node.js
+- Docker & Docker Compose
+- Redis
+- MongoDB
+
+## 주의사항
+1. 서버 종료 시 반드시 Ctrl+C를 사용하여 정상 종료
+2. 비정상 종료 시 Redis에 백업된 데이터가 있을 수 있음
+3. 서버 재시작 시 자동으로 백업된 데이터 복구
+
+## 에러 처리
+- 배치 처리 실패 시 해당 항목들을 다시 큐에 추가
+- Redis 연결 실패 시 로그 출력
+- MongoDB 연결 실패 시 로그 출력
